@@ -1,0 +1,1148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>手势御剑</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050a10; color: #a8e8ff; font: 14px/1.8 "Noto Serif SC", "Songti SC", serif; }
+    canvas { position: fixed; inset: 0; }
+    #camera { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+    #hud { position: fixed; left: 18px; top: 14px; pointer-events: none; text-shadow: 0 0 8px #00aaff; }
+    #status { margin-top: 6px; color: #fff; }
+    #sound-status { margin-top: 4px; color: #c8f6ff; }
+    #fps-status { margin-top: 3px; font-size: 12px; color: #8fc7d8; }
+    #game-hud { position: fixed; right: 20px; top: 14px; text-align: right; pointer-events: none; text-shadow: 0 0 8px #00aaff; }
+    #game-screen, #combo-banner { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; pointer-events: none; text-shadow: 0 0 14px #00cfff; }
+    #game-screen { font-size: 18px; } #game-screen strong { display: block; font-size: 42px; }
+    #combo-banner { font-size: 42px; color: #d9fbff; opacity: 0; }
+    .score-pop { position: fixed; color: #d9fbff; font-weight: bold; pointer-events: none; text-shadow: 0 0 10px #00cfff; }
+    @keyframes pulse { from { opacity: .45; } to { opacity: 1; } }
+  </style>
+</head>
+<body>
+    <div id="hud">
+      <div id="hint">正在加载模型和摄像头…</div>
+      <div id="status"></div>
+      <div id="sound-status">点击屏幕开启声音</div>
+      <div id="fps-status"></div>
+  </div>
+  <div id="game-hud"></div>
+  <div id="game-screen"></div>
+  <div id="combo-banner"></div>
+  <video id="camera" playsinline muted></video>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+    import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+    import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    /* ---------- 可调参数 ---------- */
+    const PARTICLES_PER_SWORD = 9000;       // 每把剑的粒子数量
+    const GESTURE_STABLE_FRAMES = 4;        // 手势连续识别相同的帧数才切换
+    const HAND_LOST_MS = 250;               // 手离开画面后开始淡出的等待时间（毫秒）
+    const GESTURE_SMOOTHNESS = 5;           // 粒子聚散、云缩放的过渡速度
+    const VISIBILITY_SMOOTHNESS = 6;        // 剑淡入淡出速度
+    const FINGER_EXTENSION_RATIO = 1.12;    // 指尖距离相对第二指节距离的伸直阈值
+    const ONE_EURO_MIN_CUT = 1.2;           // 位置与方向 One Euro 滤波最低截止频率
+    const ONE_EURO_BETA = 0.03;             // One Euro 对移动速度的自适应系数
+    const ONE_EURO_SIZE_MIN_CUT = 0.5;      // 手部尺寸滤波最低截止频率
+    const CAMERA_FOV = 50;                  // 透视相机视角
+    const CAMERA_Z = 6;                     // 透视相机距离
+    const PREVIEW_WIDTH = 640;              // 摄像头请求宽度
+    const PREVIEW_HEIGHT = 480;             // 摄像头请求高度
+    const SPRING_STIFFNESS = 60;            // 剑位置与角度追随手势目标的弹簧刚度
+    const SPRING_DAMPING = 9;               // 剑位置与角度弹簧阻尼，数值越大回弹越弱
+    const SWORD_TIP_LOCAL_Y = 1.1;          // 剑尖在剑局部坐标中的 Y 位置
+    const TRAIL_POINT_COUNT = 40;           // 每把剑拖尾环形缓冲区的采样点数量
+    const TRAIL_LIFETIME = 0.7;             // 拖尾粒子从生成到自然消散的时间（秒）
+    const BLOOM_STRENGTH = 0.5;             // 全屏泛光强度
+    const BLOOM_RADIUS = 0.6;               // 全屏泛光半径
+    const BLOOM_THRESHOLD = 0.35;           // 全屏泛光亮度阈值，避免暗背景参与泛光
+    const USE_CAMERA_BG = true;             // 是否使用实时摄像头作为场景背景，false 时显示纯色背景
+    const BG_BRIGHTNESS = 0.18;             // 摄像头背景的整体亮度倍率
+    const BG_TINT_COLOR = 0x0a1a2a;         // 覆盖在摄像头上的深蓝色调
+    const BG_TINT_MIX = 0.5;                // 深蓝色调的混合比例
+    const BG_PLANE_Z = -10;                 // 摄像头背景平面所在的最远 Z 坐标
+    const STAR_COUNT = 800;                 // 背景星尘粒子数量
+    const STAR_PARALLAX_SMOOTHNESS = 3;     // 星尘视差跟随手掌平均位置的平滑速度
+    const STAR_PARALLAX_STRENGTH = 0.08;    // 星尘随手掌移动的视差幅度
+    const BURST_COOLDOWN = 0.5;             // 同一只手两次握拳转张开的爆发冷却时间（秒）
+    const BURST_CLOUD_SCALE = 2.6;          // 爆发瞬间的云半径倍率
+    const BURST_CLOUD_DECAY = 0.6;          // 爆发云半径指数衰减到正常值的时间（秒）
+    const SHOCKWAVE_DURATION = 0.7;         // 冲击波光环从出现到消失的时间（秒）
+    const SLASH_SPEED = 9;                  // 触发剑气斩所需的手部移动速度（世界单位/秒）
+    const SLASH_COOLDOWN = 0.4;             // 同一只手两次剑气斩之间的冷却时间（秒）
+    const SLASH_SPEED_SMOOTHNESS = 12;      // 手部移动速度指数平滑速度，抑制单帧尖峰
+    const SLASH_POOL_SIZE = 4;              // 每只手预创建并循环复用的剑气数量
+    const SLASH_PARTICLE_COUNT = 600;       // 每道月牙剑气的粒子数量
+    const SLASH_RADIUS = 1.2;               // 月牙剑气的弧线半径
+    const SLASH_ANGLE = Math.PI * 2 / 3;    // 月牙剑气的张角（120 度）
+    const SLASH_TRAVEL_SPEED = 8;           // 月牙剑气沿挥动方向飞行的速度（世界单位/秒）
+    const SLASH_DURATION = 1.2;             // 月牙剑气飞行并消散的时长（秒）
+    const SLASH_RECOIL_DURATION = 0.15;    // 剑气斩后剑本体轻微后坐的恢复时长（秒）
+    const MASTER_VOLUME = 0.5;              // WebAudio 主音量
+    const SWORD_CHIME_COOLDOWN = 0.3;       // 同一只手剑鸣音效冷却时间（秒）
+    const WIND_MAX_GAIN = 0.25;             // 风声音量上限
+    const WIND_MAX_SPEED = 18;              // 风声达到最大音量对应的移动速度
+    const AUDIO_SMOOTH_TIME = 0.08;         // 风声音量和滤波频率 setTargetAtTime 的时间常数
+    const PARTICLE_BASE_COLOR = new THREE.Color(0.0, 0.7, 1.0);        // 普通粒子的饱和青蓝色
+    const PARTICLE_HIGHLIGHT_COLOR = new THREE.Color(0.55, 0.95, 1.0); // 剑尖与中脊的亮高光颜色
+    const PARTICLE_FLASH_COLOR = new THREE.Color(0.7, 1.0, 1.0);       // 凝剑瞬间闪光颜色
+    const PARTICLE_ALPHA_SCALE = 0.7;       // 粒子整体透明度倍率，避免叠加过曝
+    const SWORD_BODY_HALF_WIDTH = 0.14;     // 剑身半宽，增加后剑更粗
+    const SWORD_SCALE = 1.4;                // 剑整体缩放倍率
+    const VIGNETTE_STRENGTH = 0.65;         // 暗角最强压暗程度，边缘最终亮度约为 0.35
+    const VIGNETTE_RADIUS = 0.45;           // 暗角开始生效的中心半径
+    const FPS_UPDATE_INTERVAL = 0.5;        // FPS 文案刷新间隔（秒）
+    const FPS_SMOOTHNESS = 2;               // FPS 指数平滑速度
+    const FPS_LOW_THRESHOLD = 30;           // 触发自适应降级的低帧率阈值
+    const FPS_LOW_DURATION = 2;             // 连续低于阈值多久后执行降级（秒）
+    const QUALITY_STEP_INTERVAL = 3;        // 两次自动降级之间的最短间隔（秒）
+    const QUALITY_PARTICLE_RATIO = 0.6;     // 第一档降级保留的剑粒子比例
+    const RITUAL_COOLDOWN = 0.5;            // 每只手凝剑仪式触发冷却时间（秒）
+    const RITUAL_FLASH_DECAY = 0.35;        // 凝剑闪光衰减时间（秒）
+    const RITUAL_RING_DURATION = 0.4;       // 凝剑小光环持续时间（秒）
+    const RITUAL_RING_START_SCALE = 0.1;    // 凝剑小光环起始缩放
+    const RITUAL_RING_END_SCALE = 1.6;      // 凝剑小光环结束缩放
+    const RITUAL_RING_OPACITY = 0.6;        // 凝剑小光环最大透明度
+    const GAME_ENABLED = true;              // 斩妖气小游戏总开关，false 时页面行为与原版一致
+    const GAME_TIME = 60;                   // 每局斩妖气的游戏时长（秒）
+    const GAME_ORB_POOL_SIZE = 12;          // 妖气光球对象池数量
+    const GAME_ORB_PARTICLES = 250;         // 每个妖气光球的粒子数量
+    const GAME_MAX_ORBS = 8;                // 同时存在的妖气光球上限
+    const GAME_ORB_LIFETIME = 9;            // 妖气光球最长存活时间（秒）
+    const GAME_SHATTER_POOL_SIZE = 12;      // 击碎爆散对象池数量
+    const GAME_SHATTER_PARTICLES = 60;      // 每个爆散特效的粒子数量
+    const GAME_FLOAT_POOL_SIZE = 8;         // 得分飘字对象池数量
+    const GAME_COMBO_WINDOW = 2;            // 连击判定时间窗口（秒）
+
+    const MODES = {
+      sword: "剑指·御剑",
+      open: "掌开·剑意四散",
+      fist: "握拳·聚气"
+    };
+
+    /* ---------- One Euro 滤波 ---------- */
+    class OneEuro {
+      constructor(minCut = ONE_EURO_MIN_CUT, beta = ONE_EURO_BETA) {
+        this.minCut = minCut;
+        this.beta = beta;
+        this.x = null;
+        this.dx = 0;
+        this.lastT = 0;
+      }
+      alpha(frequency, dt) {
+        const r = 2 * Math.PI * frequency * dt;
+        return r / (r + 1);
+      }
+      filter(value, time) {
+        if (this.x === null) {
+          this.x = value;
+          this.lastT = time;
+          return value;
+        }
+        const dt = Math.max((time - this.lastT) / 1000, 1e-3);
+        this.lastT = time;
+        this.dx += this.alpha(1, dt) * ((value - this.x) / dt - this.dx);
+        const cut = this.minCut + this.beta * Math.abs(this.dx);
+        this.x += this.alpha(cut, dt) * (value - this.x);
+        return this.x;
+      }
+    }
+
+    /* ---------- Three.js 场景 ---------- */
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    let pixelRatio = Math.min(window.devicePixelRatio, 2);
+    renderer.setPixelRatio(pixelRatio);
+    document.body.prepend(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x050a10);
+    const camera = new THREE.PerspectiveCamera(CAMERA_FOV, 1, 0.1, 100);
+    camera.position.z = CAMERA_Z;
+    const composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      BLOOM_STRENGTH,
+      BLOOM_RADIUS,
+      BLOOM_THRESHOLD
+    );
+    composer.addPass(bloomPass);
+    const vignettePass = new ShaderPass({
+      uniforms: {
+        tDiffuse: { value: null },
+        uStrength: { value: VIGNETTE_STRENGTH },
+        uRadius: { value: VIGNETTE_RADIUS }
+      },
+      vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float uStrength;
+        uniform float uRadius;
+        varying vec2 vUv;
+        void main() {
+          vec4 color = texture2D(tDiffuse, vUv);
+          float distanceToCenter = length(vUv - 0.5) * 2.0;
+          float edge = smoothstep(uRadius, 1.0, distanceToCenter);
+          color.rgb *= 1.0 - uStrength * edge;
+          gl_FragColor = color;
+        }
+      `
+    });
+    composer.addPass(vignettePass);
+    let worldW = 1;
+    let worldH = 1;
+    let backgroundVideoPlane;
+    let backgroundTintPlane;
+
+    function resize() {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      composer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      worldH = 2 * CAMERA_Z * Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2));
+      worldW = worldH * camera.aspect;
+      if (backgroundVideoPlane) updateCameraBackground();
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    /* ---------- 粒子剑着色器 ---------- */
+    const vertexShader = `
+      attribute vec3 aS;
+      attribute vec3 aC;
+      attribute float aR;
+      attribute float aH;
+      uniform float uG;
+      uniform float uT;
+      uniform float uCS;
+      uniform float uA;
+      uniform float uPx;
+      varying float vH;
+      varying float vA;
+      void main() {
+        float angle = uT * (0.5 + aR * 1.2);
+        float c = cos(angle), s = sin(angle);
+        vec3 cloud = aC * uCS;
+        cloud.xz = mat2(c, -s, s, c) * cloud.xz;
+        cloud.y += sin(uT * 1.5 + aR * 20.0) * 0.05;
+        vec3 sword = aS + 0.01 * sin(uT * 3.0 + aR * vec3(40.0, 30.0, 20.0));
+        float g = smoothstep(aR * 0.4, aR * 0.4 + 0.6, uG);
+        vec4 mv = modelViewMatrix * vec4(mix(cloud, sword, g), 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = uPx * (mix(2.6, 3.2, g) + aH * 2.0) * (6.0 / -mv.z);
+        vH = aH;
+        vA = uA * mix(0.55, 1.0, g);
+      }
+    `;
+    const fragmentShader = `
+      varying float vH;
+      varying float vA;
+      uniform vec3 uBaseColor;
+      uniform vec3 uHighlightColor;
+      uniform vec3 uFlashColor;
+      uniform float uFlash;
+      uniform float uAlphaScale;
+      void main() {
+        float distanceToCenter = length(gl_PointCoord - 0.5);
+        if (distanceToCenter > 0.5) discard;
+        vec3 color = mix(uBaseColor, uHighlightColor, vH);
+        color = mix(color, uFlashColor, uFlash * 0.6);
+        float softEdge = smoothstep(0.5, 0.0, distanceToCenter);
+        gl_FragColor = vec4(color, softEdge * vA * uAlphaScale);
+      }
+    `;
+
+    const trailVertexShader = `
+      attribute float aLife;
+      uniform float uPx;
+      varying float vLife;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = uPx * (1.0 + aLife * 4.5) * (6.0 / -mv.z);
+        vLife = aLife;
+      }
+    `;
+    const trailFragmentShader = `
+      varying float vLife;
+      void main() {
+        float distanceToCenter = length(gl_PointCoord - 0.5);
+        if (distanceToCenter > 0.5) discard;
+        float softEdge = smoothstep(0.5, 0.0, distanceToCenter);
+        gl_FragColor = vec4(vec3(0.1, 0.75, 1.0), softEdge * vLife * 0.8);
+      }
+    `;
+
+    const starVertexShader = `
+      attribute float aSize;
+      attribute float aSpeed;
+      attribute float aSeed;
+      uniform float uT;
+      uniform float uPx;
+      uniform vec2 uParallax;
+      varying float vAlpha;
+      void main() {
+        vec3 p = position;
+        p.y = mod(p.y + uT * aSpeed + 4.0, 8.0) - 4.0;
+        float depthFactor = (2.0 - p.z) / 5.0;
+        p.xy += uParallax * depthFactor;
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = uPx * aSize * (6.0 / -mv.z);
+        vAlpha = 0.18 + 0.32 * (0.5 + 0.5 * sin(uT * (0.8 + aSeed) + aSeed * 20.0));
+      }
+    `;
+    const starFragmentShader = `
+      varying float vAlpha;
+      void main() {
+        float distanceToCenter = length(gl_PointCoord - 0.5);
+        if (distanceToCenter > 0.5) discard;
+        gl_FragColor = vec4(vec3(0.35, 0.85, 1.0), smoothstep(0.5, 0.0, distanceToCenter) * vAlpha);
+      }
+    `;
+
+    const slashVertexShader = `
+      attribute float aB;
+      uniform float uOpacity;
+      uniform float uPx;
+      varying float vBrightness;
+      varying float vOpacity;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = uPx * (2.2 + aB * 3.0) * (6.0 / -mv.z);
+        vBrightness = aB;
+        vOpacity = uOpacity;
+      }
+    `;
+    const slashFragmentShader = `
+      varying float vBrightness;
+      varying float vOpacity;
+      void main() {
+        float distanceToCenter = length(gl_PointCoord - 0.5);
+        if (distanceToCenter > 0.5) discard;
+        vec3 color = mix(vec3(0.05, 0.35, 0.55), vec3(0.9, 1.0, 1.0), vBrightness);
+        gl_FragColor = vec4(color, smoothstep(0.5, 0.0, distanceToCenter) * vOpacity * (0.35 + 0.65 * vBrightness));
+      }
+    `;
+
+    function randomSpherePoint(radius) {
+      const azimuth = Math.random() * Math.PI * 2;
+      const polar = Math.acos(2 * Math.random() - 1);
+      return [
+        radius * Math.sin(polar) * Math.cos(azimuth),
+        radius * Math.cos(polar),
+        radius * Math.sin(polar) * Math.sin(azimuth)
+      ];
+    }
+
+    function createSword() {
+      const swordPositions = new Float32Array(PARTICLES_PER_SWORD * 3);
+      const cloudPositions = new Float32Array(PARTICLES_PER_SWORD * 3);
+      const randoms = new Float32Array(PARTICLES_PER_SWORD);
+      const highlights = new Float32Array(PARTICLES_PER_SWORD);
+
+      for (let i = 0; i < PARTICLES_PER_SWORD; i++) {
+        const r = Math.random();
+        let x, y, z, high = 0;
+        if (r < 0.72) {
+          const t = Math.random();
+          const halfWidth = t < 0.8 ? SWORD_BODY_HALF_WIDTH : SWORD_BODY_HALF_WIDTH * (1 - t) / 0.2;
+          x = (Math.random() * 2 - 1) * halfWidth;
+          y = 0.15 + t * 1.5;
+          z = (Math.random() * 2 - 1) * 0.015;
+          high = Math.abs(x) < 0.012 || t > 0.93 ? 1 : 0;
+        } else if (r < 0.82) {
+          x = (Math.random() * 2 - 1) * 0.38;
+          y = 0.08 + Math.random() * 0.08;
+          z = (Math.random() * 2 - 1) * 0.04;
+          high = 0.4;
+        } else if (r < 0.94) {
+          const angle = Math.random() * Math.PI * 2;
+          const radius = Math.sqrt(Math.random()) * 0.045;
+          x = Math.cos(angle) * radius;
+          z = Math.sin(angle) * radius;
+          y = -0.4 + Math.random() * 0.48;
+        } else {
+          const point = randomSpherePoint(Math.cbrt(Math.random()) * 0.08);
+          x = point[0];
+          y = -0.48 + point[1];
+          z = point[2];
+          high = 0.6;
+        }
+
+        swordPositions.set([x, y - 0.55, z], i * 3);
+        cloudPositions.set(randomSpherePoint(0.4 + Math.random() * 1.3), i * 3);
+        randoms[i] = Math.random();
+        highlights[i] = high;
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(swordPositions.slice(), 3));
+      geometry.setAttribute("aS", new THREE.BufferAttribute(swordPositions, 3));
+      geometry.setAttribute("aC", new THREE.BufferAttribute(cloudPositions, 3));
+      geometry.setAttribute("aR", new THREE.BufferAttribute(randoms, 1));
+      geometry.setAttribute("aH", new THREE.BufferAttribute(highlights, 1));
+
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          uG: { value: 0 }, uT: { value: 0 }, uCS: { value: 1 },
+          uA: { value: 0 }, uPx: { value: pixelRatio }, uFlash: { value: 0 },
+          uBaseColor: { value: PARTICLE_BASE_COLOR },
+          uHighlightColor: { value: PARTICLE_HIGHLIGHT_COLOR },
+          uFlashColor: { value: PARTICLE_FLASH_COLOR },
+          uAlphaScale: { value: PARTICLE_ALPHA_SCALE }
+        },
+        vertexShader,
+        fragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      });
+      const points = new THREE.Points(geometry, material);
+      points.frustumCulled = false;
+
+      const inner = new THREE.Group();
+      inner.add(points);
+      const group = new THREE.Group();
+      group.add(inner);
+      scene.add(group);
+
+      return {
+        group, inner, material, geometry, points,
+        mode: "open", candidate: "open", candidateFrames: 0,
+        g: 0, cloudScale: 1, burstScale: 1, lastBurstAt: -Infinity, alpha: 0, seenAt: -Infinity,
+        lastSlashAt: -Infinity, lastChimeAt: -Infinity, lastRitualAt: -Infinity, recoil: 0, flash: 0,
+        lastSpeedX: null, lastSpeedY: null, lastSpeedAt: null, movementSpeed: 0, moveDirX: 1, moveDirY: 0,
+        x: 0.5, y: 0.5, vx: 0, vy: 1, size: 0.16,
+        springX: 0, springY: 0, springVX: 0, springVY: 0,
+        springAngle: 0, springAngularVelocity: 0, springReady: false,
+        filterX: new OneEuro(), filterY: new OneEuro(),
+        filterVX: new OneEuro(), filterVY: new OneEuro(),
+        filterSize: new OneEuro(ONE_EURO_SIZE_MIN_CUT)
+      };
+    }
+
+    function createTrail() {
+      const positions = new Float32Array(TRAIL_POINT_COUNT * 3);
+      const life = new Float32Array(TRAIL_POINT_COUNT);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute("aLife", new THREE.BufferAttribute(life, 1));
+      const material = new THREE.ShaderMaterial({
+        uniforms: { uPx: { value: pixelRatio } },
+        vertexShader: trailVertexShader,
+        fragmentShader: trailFragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      });
+      const points = new THREE.Points(geometry, material);
+      points.frustumCulled = false;
+      scene.add(points);
+      return { points, material, positions, life, nextIndex: 0 };
+    }
+
+    function createStars() {
+      const positions = new Float32Array(STAR_COUNT * 3);
+      const sizes = new Float32Array(STAR_COUNT);
+      const speeds = new Float32Array(STAR_COUNT);
+      const seeds = new Float32Array(STAR_COUNT);
+      for (let i = 0; i < STAR_COUNT; i++) {
+        positions[i * 3] = (Math.random() * 2 - 1) * 8;
+        positions[i * 3 + 1] = (Math.random() * 2 - 1) * 4;
+        positions[i * 3 + 2] = -3 + Math.random() * 5;
+        sizes[i] = 1.5 + Math.random() * 1.5;
+        speeds[i] = 0.03 + Math.random() * 0.08;
+        seeds[i] = Math.random();
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+      geometry.setAttribute("aSpeed", new THREE.BufferAttribute(speeds, 1));
+      geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          uT: { value: 0 }, uPx: { value: pixelRatio },
+          uParallax: { value: new THREE.Vector2() }
+        },
+        vertexShader: starVertexShader,
+        fragmentShader: starFragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      });
+      const points = new THREE.Points(geometry, material);
+      points.frustumCulled = false;
+      scene.add(points);
+      return { points, material, parallax: new THREE.Vector2() };
+    }
+
+    function createShockwave() {
+      const material = new THREE.MeshBasicMaterial({
+        color: 0x19cfff,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      });
+      const mesh = new THREE.Mesh(new THREE.RingGeometry(0.88, 1, 64), material);
+      mesh.visible = false;
+      mesh.renderOrder = 10;
+      scene.add(mesh);
+      return {
+        mesh, material, age: SHOCKWAVE_DURATION, duration: SHOCKWAVE_DURATION,
+        startScale: 0.2, endScale: 4, maxOpacity: 0.9
+      };
+    }
+
+    function createSlash() {
+      const positions = new Float32Array(SLASH_PARTICLE_COUNT * 3);
+      const brightness = new Float32Array(SLASH_PARTICLE_COUNT);
+      for (let i = 0; i < SLASH_PARTICLE_COUNT; i++) {
+        const angle = (Math.random() - 0.5) * SLASH_ANGLE;
+        const centerWeight = 1 - Math.abs(angle) / (SLASH_ANGLE / 2);
+        const thickness = (Math.random() * 2 - 1) * 0.14 * centerWeight;
+        const radius = SLASH_RADIUS + thickness;
+        positions[i * 3] = Math.cos(angle) * radius;
+        positions[i * 3 + 1] = Math.sin(angle) * radius;
+        positions[i * 3 + 2] = (Math.random() * 2 - 1) * 0.025;
+        brightness[i] = Math.max(0, Math.min(1, centerWeight + (Math.random() - 0.5) * 0.18));
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geometry.setAttribute("aB", new THREE.BufferAttribute(brightness, 1));
+      const material = new THREE.ShaderMaterial({
+        uniforms: { uOpacity: { value: 0 }, uPx: { value: pixelRatio } },
+        vertexShader: slashVertexShader,
+        fragmentShader: slashFragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending
+      });
+      const points = new THREE.Points(geometry, material);
+      points.frustumCulled = false;
+      points.visible = false;
+      scene.add(points);
+      return { points, material, active: false, age: SLASH_DURATION, direction: new THREE.Vector2(1, 0) };
+    }
+
+    const swords = [createSword(), createSword()];
+    const trails = [createTrail(), createTrail()];
+    const stars = createStars();
+    const shockwaves = [createShockwave(), createShockwave()];
+    const slashPools = Array.from({ length: 2 }, () => Array.from({ length: SLASH_POOL_SIZE }, createSlash));
+    const slashNext = [0, 0];
+
+    function createGameOrb() {
+      const positions = new Float32Array(GAME_ORB_PARTICLES * 3);
+      for (let i = 0; i < GAME_ORB_PARTICLES; i++) {
+        const r = Math.cbrt(Math.random()), a = Math.random() * Math.PI * 2, b = Math.acos(2 * Math.random() - 1);
+        positions.set([r * Math.sin(b) * Math.cos(a), r * Math.cos(b), r * Math.sin(b) * Math.sin(a)], i * 3);
+      }
+      const geo = new THREE.BufferGeometry(); geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      const mat = new THREE.PointsMaterial({ color: 0xff3d8a, size: 0.055, transparent: true, opacity: 0.9, depthWrite: false, blending: THREE.AdditiveBlending });
+      const points = new THREE.Points(geo, mat); points.visible = false; points.frustumCulled = false; scene.add(points);
+      return { points, mat, active: false, age: 0, rare: false, radius: 0.4, vx: 0, vy: 0, phase: 0 };
+    }
+    function createShatter() {
+      const positions = new Float32Array(GAME_SHATTER_PARTICLES * 3), velocities = new Float32Array(GAME_SHATTER_PARTICLES * 3);
+      for (let i = 0; i < GAME_SHATTER_PARTICLES; i++) { const a = Math.random() * Math.PI * 2, z = Math.random() * 2 - 1, q = Math.sqrt(1 - z * z); velocities.set([Math.cos(a) * q, Math.sin(a) * q, z], i * 3); }
+      const geo = new THREE.BufferGeometry(); geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      const mat = new THREE.PointsMaterial({ color: 0xff3d8a, size: 0.065, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
+      const points = new THREE.Points(geo, mat); points.visible = false; points.frustumCulled = false; scene.add(points);
+      return { points, mat, positions, velocities, active: false, age: 0 };
+    }
+    const gameOrbs = GAME_ENABLED ? Array.from({ length: GAME_ORB_POOL_SIZE }, createGameOrb) : [];
+    const gameShatters = GAME_ENABLED ? Array.from({ length: GAME_SHATTER_POOL_SIZE }, createShatter) : [];
+    let gameOrbNext = 0, gameShatterNext = 0, gameFloatNext = 0;
+    const video = document.getElementById("camera");
+    const hint = document.getElementById("hint");
+    const status = document.getElementById("status");
+    const soundStatus = document.getElementById("sound-status");
+    const fpsStatus = document.getElementById("fps-status");
+    const gameHud = document.getElementById("game-hud");
+    const gameScreen = document.getElementById("game-screen");
+    const comboBanner = document.getElementById("combo-banner");
+    const gameFloats = GAME_ENABLED ? Array.from({ length: GAME_FLOAT_POOL_SIZE }, () => { const el = document.createElement("div"); el.className = "score-pop"; el.style.display = "none"; document.body.append(el); return { el, active: false, age: 0 }; }) : [];
+    const game = { state: "ready", score: 0, best: 0, combo: 0, lastHit: -Infinity, startAt: 0, spawnAt: 0, banner: 0, bloom: 0 };
+    if (GAME_ENABLED) try { game.best = Number(localStorage.getItem("yujian-best") || 0); } catch (_) {}
+    let fpsVisible = true;
+    let smoothFps = 60;
+    let fpsUpdateAt = 0;
+    let lowFpsElapsed = 0;
+    let lastQualityStepAt = -Infinity;
+    let qualityStep = 0;
+
+    function gameMessage() {
+      if (!GAME_ENABLED) { gameHud.style.display = gameScreen.style.display = "none"; return; }
+      gameHud.style.display = "block";
+      if (game.state === "ready") gameScreen.innerHTML = "<strong>斩妖气</strong>按空格键或点击屏幕开始";
+      else if (game.state === "over") gameScreen.innerHTML = `<strong>斩妖气</strong>本局得分：${game.score}<br>最高分：${game.best}<br>按空格键再来一局`;
+      else gameScreen.textContent = "";
+    }
+    function clearGameObjects() { gameOrbs.forEach(o => { o.active = false; o.points.visible = false; }); gameShatters.forEach(s => { s.active = false; s.points.visible = false; }); gameFloats.forEach(f => { f.active = false; f.el.style.display = "none"; }); }
+    function startGame(now) { if (!GAME_ENABLED) return; clearGameObjects(); Object.assign(game, { state: "playing", score: 0, combo: 0, lastHit: -Infinity, startAt: now, spawnAt: now, banner: 0, bloom: 0 }); gameMessage(); }
+    function spawnOrb() {
+      const o = gameOrbs[gameOrbNext]; gameOrbNext = (gameOrbNext + 1) % GAME_ORB_POOL_SIZE;
+      const side = Math.floor(Math.random() * 4), margin = 1.0;
+      const x = side < 2 ? (side ? worldW / 2 + margin : -worldW / 2 - margin) : (Math.random() - .5) * worldW;
+      const y = side < 2 ? (Math.random() - .5) * worldH : (side === 2 ? worldH / 2 + margin : -worldH / 2 - margin);
+      const targetX = (Math.random() - .5) * worldW * .6, targetY = (Math.random() - .5) * worldH * .6, d = Math.hypot(targetX - x, targetY - y) || 1, speed = .4 + Math.random() * .5;
+      o.active = true; o.age = 0; o.rare = Math.random() < .1; o.radius = .35 + Math.random() * .15; o.vx = (targetX - x) / d * speed; o.vy = (targetY - y) / d * speed; o.phase = Math.random() * 6.28;
+      o.points.position.set(x, y, 0); o.points.scale.setScalar(o.radius); o.mat.color.set(o.rare ? 0xffd54a : (Math.random() < .5 ? 0xff3d8a : 0xa03dff)); o.points.visible = true;
+    }
+    function playHitSound(rare) { if (!audioContext || !masterGain || muted) return; const n = audioContext.currentTime, f = Math.min(2000, 660 * Math.pow(1.06, game.combo - 1)); [1, ...(rare ? [2] : [])].forEach(m => { const o = audioContext.createOscillator(), g = audioContext.createGain(); o.frequency.setValueAtTime(f * m, n); g.gain.setValueAtTime(.15 / m, n); g.gain.exponentialRampToValueAtTime(.0001, n + .25); o.connect(g).connect(masterGain); o.start(n); o.stop(n + .26); o.onended = () => { o.disconnect(); g.disconnect(); }; }); }
+    function hitOrb(o, swordHit) {
+      o.active = false; o.points.visible = false; const base = o.rare ? 30 : 10; game.combo = performance.now() - game.lastHit <= GAME_COMBO_WINDOW * 1000 ? game.combo + 1 : 1; game.lastHit = performance.now(); const points = base * Math.min(game.combo, 5); game.score += points; playHitSound(o.rare);
+      const s = gameShatters[gameShatterNext]; gameShatterNext = (gameShatterNext + 1) % GAME_SHATTER_POOL_SIZE; s.active = true; s.age = 0; s.points.position.copy(o.points.position); s.mat.color.copy(o.mat.color); s.mat.opacity = 1; s.points.visible = true;
+      const f = gameFloats[gameFloatNext]; gameFloatNext = (gameFloatNext + 1) % GAME_FLOAT_POOL_SIZE; const p = o.points.position.clone().project(camera); f.active = true; f.age = 0; f.x = (p.x * .5 + .5) * innerWidth; f.y = (-p.y * .5 + .5) * innerHeight; f.el.textContent = `+${points}${game.combo > 1 ? ` ×${game.combo}` : ""}`; f.el.style.display = "block";
+      if (swordHit) swordHit.recoil = 1; if (game.combo % 5 === 0) { game.banner = .8; game.bloom = .5; comboBanner.textContent = `×${game.combo} 连斩`; }
+    }
+    let audioContext = null;
+    let masterGain = null;
+    let windSource = null;
+    let windFilter = null;
+    let windGain = null;
+    let muted = false;
+
+    function updateSoundStatus() {
+      if (!audioContext) {
+        soundStatus.textContent = "点击屏幕开启声音";
+      } else {
+        soundStatus.textContent = muted ? "声音：静音（按 M 取消静音）" : "声音：开启（按 M 静音）";
+      }
+    }
+
+    async function enableAudio() {
+      if (!audioContext) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass) return;
+        audioContext = new AudioContextClass();
+        masterGain = audioContext.createGain();
+        masterGain.gain.value = MASTER_VOLUME;
+        masterGain.connect(audioContext.destination);
+        const noiseBuffer = audioContext.createBuffer(1, audioContext.sampleRate * 2, audioContext.sampleRate);
+        const noise = noiseBuffer.getChannelData(0);
+        for (let i = 0; i < noise.length; i++) noise[i] = Math.random() * 2 - 1;
+        windSource = audioContext.createBufferSource();
+        windSource.buffer = noiseBuffer;
+        windSource.loop = true;
+        windFilter = audioContext.createBiquadFilter();
+        windFilter.type = "bandpass";
+        windFilter.Q.value = 1;
+        windFilter.frequency.value = 400;
+        windGain = audioContext.createGain();
+        windGain.gain.value = 0;
+        windSource.connect(windFilter).connect(windGain).connect(masterGain);
+        windSource.start();
+      }
+      await audioContext.resume();
+      updateSoundStatus();
+    }
+
+    function makeNoiseSource(duration) {
+      if (!audioContext || !masterGain) return null;
+      const buffer = audioContext.createBuffer(1, Math.ceil(audioContext.sampleRate * duration), audioContext.sampleRate);
+      const samples = buffer.getChannelData(0);
+      for (let i = 0; i < samples.length; i++) samples[i] = Math.random() * 2 - 1;
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      return source;
+    }
+
+    function playSwordChime() {
+      if (!audioContext || !masterGain || muted) return;
+      const now = audioContext.currentTime;
+      [1, 1.5].forEach(multiplier => {
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(1200 * multiplier, now);
+        oscillator.frequency.linearRampToValueAtTime(2400 * multiplier, now + 0.15);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.linearRampToValueAtTime(0.12 / (multiplier === 1 ? 1 : 1.5), now + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.61);
+        oscillator.connect(gain).connect(masterGain);
+        oscillator.start(now);
+        oscillator.stop(now + 0.62);
+        oscillator.onended = () => { oscillator.disconnect(); gain.disconnect(); };
+      });
+    }
+
+    function playSlashSound() {
+      if (!audioContext || !masterGain || muted) return;
+      const now = audioContext.currentTime;
+      const source = makeNoiseSource(0.25);
+      const filter = audioContext.createBiquadFilter();
+      const gain = audioContext.createGain();
+      filter.type = "highpass";
+      filter.frequency.setValueAtTime(800, now);
+      filter.frequency.exponentialRampToValueAtTime(4000, now + 0.25);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(0.2, now + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+      source.connect(filter).connect(gain).connect(masterGain);
+      source.start(now);
+      source.onended = () => { source.disconnect(); filter.disconnect(); gain.disconnect(); };
+      const oscillator = audioContext.createOscillator();
+      const thumpGain = audioContext.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(200, now);
+      oscillator.frequency.exponentialRampToValueAtTime(80, now + 0.15);
+      thumpGain.gain.setValueAtTime(0.2, now);
+      thumpGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.15);
+      oscillator.connect(thumpGain).connect(masterGain);
+      oscillator.start(now);
+      oscillator.stop(now + 0.16);
+      oscillator.onended = () => { oscillator.disconnect(); thumpGain.disconnect(); };
+    }
+
+    function playBurstSound() {
+      if (!audioContext || !masterGain || muted) return;
+      const now = audioContext.currentTime;
+      const oscillator = audioContext.createOscillator();
+      const toneGain = audioContext.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(120, now);
+      oscillator.frequency.exponentialRampToValueAtTime(40, now + 0.5);
+      toneGain.gain.setValueAtTime(0.25, now);
+      toneGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+      oscillator.connect(toneGain).connect(masterGain);
+      oscillator.start(now);
+      oscillator.stop(now + 0.51);
+      oscillator.onended = () => { oscillator.disconnect(); toneGain.disconnect(); };
+      const source = makeNoiseSource(0.3);
+      const filter = audioContext.createBiquadFilter();
+      const gain = audioContext.createGain();
+      filter.type = "lowpass";
+      filter.frequency.value = 900;
+      gain.gain.setValueAtTime(0.25, now);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+      source.connect(filter).connect(gain).connect(masterGain);
+      source.start(now);
+      source.onended = () => { source.disconnect(); filter.disconnect(); gain.disconnect(); };
+    }
+
+    function updateWind(maxSpeed) {
+      if (!audioContext || !windGain || !windFilter) return;
+      const now = audioContext.currentTime;
+      const amount = Math.min(1, maxSpeed / WIND_MAX_SPEED);
+      windGain.gain.setTargetAtTime(amount * WIND_MAX_GAIN, now, AUDIO_SMOOTH_TIME);
+      windFilter.frequency.setTargetAtTime(400 + amount * 1400, now, AUDIO_SMOOTH_TIME);
+    }
+
+    document.addEventListener("click", enableAudio, { once: true });
+    document.addEventListener("click", () => { if (GAME_ENABLED && game.state !== "playing") startGame(performance.now()); });
+    window.addEventListener("keydown", async event => {
+      await enableAudio();
+      if (event.key.toLowerCase() === "m" && masterGain) {
+        muted = !muted;
+        masterGain.gain.setTargetAtTime(muted ? 0 : MASTER_VOLUME, audioContext.currentTime, 0.02);
+        updateSoundStatus();
+      }
+      if (event.key.toLowerCase() === "f") {
+        fpsVisible = !fpsVisible;
+        fpsStatus.style.display = fpsVisible ? "block" : "none";
+      }
+      if (event.code === "Space" && GAME_ENABLED && game.state !== "playing") { event.preventDefault(); startGame(performance.now()); }
+    });
+    gameMessage();
+
+    function createCameraBackground() {
+      const texture = new THREE.VideoTexture(video);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.repeat.set(-1, 1);
+      texture.offset.set(1, 0);
+      const geometry = new THREE.PlaneGeometry(1, 1);
+      const videoMaterial = new THREE.MeshBasicMaterial({
+        map: texture,
+        color: new THREE.Color(BG_BRIGHTNESS, BG_BRIGHTNESS, BG_BRIGHTNESS),
+        depthWrite: false,
+        depthTest: false
+      });
+      const tintMaterial = new THREE.MeshBasicMaterial({
+        color: BG_TINT_COLOR,
+        transparent: true,
+        opacity: BG_TINT_MIX,
+        depthWrite: false,
+        depthTest: false
+      });
+      backgroundVideoPlane = new THREE.Mesh(geometry, videoMaterial);
+      backgroundTintPlane = new THREE.Mesh(geometry, tintMaterial);
+      backgroundVideoPlane.position.z = BG_PLANE_Z;
+      backgroundTintPlane.position.z = BG_PLANE_Z + 0.001;
+      backgroundVideoPlane.renderOrder = -1000;
+      backgroundTintPlane.renderOrder = -999;
+      backgroundVideoPlane.visible = USE_CAMERA_BG;
+      backgroundTintPlane.visible = USE_CAMERA_BG;
+      scene.add(backgroundVideoPlane, backgroundTintPlane);
+      updateCameraBackground();
+    }
+
+    function updateCameraBackground() {
+      if (!backgroundVideoPlane) return;
+      const distance = CAMERA_Z - BG_PLANE_Z;
+      const planeHeight = 2 * distance * Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV / 2));
+      const planeWidth = planeHeight * camera.aspect;
+      backgroundVideoPlane.scale.set(planeWidth, planeHeight, 1);
+      backgroundTintPlane.scale.set(planeWidth, planeHeight, 1);
+      const videoAspect = video.videoWidth && video.videoHeight ? video.videoWidth / video.videoHeight : PREVIEW_WIDTH / PREVIEW_HEIGHT;
+      const screenAspect = camera.aspect;
+      if (videoAspect > screenAspect) {
+        const visibleWidth = screenAspect / videoAspect;
+        backgroundVideoPlane.material.map.repeat.set(-visibleWidth, 1);
+        backgroundVideoPlane.material.map.offset.set((1 + visibleWidth) / 2, 0);
+      } else {
+        const visibleHeight = videoAspect / screenAspect;
+        backgroundVideoPlane.material.map.repeat.set(-1, visibleHeight);
+        backgroundVideoPlane.material.map.offset.set(1, (1 - visibleHeight) / 2);
+      }
+      backgroundVideoPlane.material.map.needsUpdate = true;
+    }
+
+    /* ---------- 手势识别与映射 ---------- */
+    function classifyHand(landmarks, aspect) {
+      const distance = (a, b) => Math.hypot((a.x - b.x) * aspect, a.y - b.y);
+      const extended = (tip, joint) => distance(landmarks[tip], landmarks[0]) > distance(landmarks[joint], landmarks[0]) * FINGER_EXTENSION_RATIO;
+      const index = extended(8, 6);
+      const middle = extended(12, 10);
+      const ring = extended(16, 14);
+      const little = extended(20, 18);
+      if (index && middle && !ring && !little) return "sword";
+      if (index && middle && ring && little) return "open";
+      return "fist";
+    }
+
+    function updateTracking(result, now) {
+      const aspect = video.videoWidth / video.videoHeight;
+      const handedness = result.handedness || result.handednesses || [];
+      const usedSlots = new Set();
+
+      result.landmarks.forEach((landmarks, index) => {
+        let slot = handedness[index]?.[0]?.categoryName === "Left" ? 0 : 1;
+        if (usedSlots.has(slot)) slot = 1 - slot;
+        usedSlots.add(slot);
+        const sword = swords[slot];
+        const wasLost = now - sword.seenAt > HAND_LOST_MS;
+        const gesture = classifyHand(landmarks, aspect);
+        sword.candidateFrames = gesture === sword.candidate ? sword.candidateFrames + 1 : 1;
+        sword.candidate = gesture;
+        let shouldBurst = false;
+        if (sword.candidateFrames >= GESTURE_STABLE_FRAMES && sword.mode !== gesture) {
+          const previousMode = sword.mode;
+          sword.mode = gesture;
+          if (gesture === "sword" && (now - sword.lastChimeAt) / 1000 >= SWORD_CHIME_COOLDOWN) {
+            sword.lastChimeAt = now;
+            playSwordChime();
+          }
+          if (gesture === "sword" && (now - sword.lastRitualAt) / 1000 >= RITUAL_COOLDOWN) {
+            triggerSwordRitual(sword, slot, now);
+          }
+          if (previousMode === "fist" && gesture === "open" && (now - sword.lastBurstAt) / 1000 >= BURST_COOLDOWN) {
+            shouldBurst = true;
+          }
+        }
+
+        sword.x = sword.filterX.filter(1 - landmarks[9].x, now);
+        sword.y = sword.filterY.filter(landmarks[9].y, now);
+        sword.vx = sword.filterVX.filter(-(landmarks[12].x - landmarks[0].x) * aspect, now);
+        sword.vy = sword.filterVY.filter(-(landmarks[12].y - landmarks[0].y), now);
+        const palmSize = Math.hypot((landmarks[0].x - landmarks[9].x) * aspect, landmarks[0].y - landmarks[9].y);
+        sword.size = sword.filterSize.filter(palmSize, now);
+        sword.seenAt = now;
+        if (shouldBurst) triggerBurst(sword, slot, now);
+
+        const worldX = (sword.x - 0.5) * worldW;
+        const worldY = -(sword.y - 0.5) * worldH;
+        if (!wasLost && sword.lastSpeedAt !== null) {
+          const speedDt = Math.max((now - sword.lastSpeedAt) / 1000, 1e-3);
+          const moveX = worldX - sword.lastSpeedX;
+          const moveY = worldY - sword.lastSpeedY;
+          const distance = Math.hypot(moveX, moveY);
+          const instantaneousSpeed = distance / speedDt;
+          const speedMix = 1 - Math.exp(-speedDt * SLASH_SPEED_SMOOTHNESS);
+          sword.movementSpeed += (instantaneousSpeed - sword.movementSpeed) * speedMix;
+          if (distance > 1e-4) {
+            sword.moveDirX = moveX / distance;
+            sword.moveDirY = moveY / distance;
+          }
+          if (sword.mode === "sword" && sword.movementSpeed > SLASH_SPEED && (now - sword.lastSlashAt) / 1000 >= SLASH_COOLDOWN) {
+            triggerSlash(sword, slot, now, worldX, worldY);
+          }
+        }
+        sword.lastSpeedX = worldX;
+        sword.lastSpeedY = worldY;
+        sword.lastSpeedAt = now;
+        if (wasLost) sword.movementSpeed = 0;
+      });
+    }
+
+    function shortestAngleDelta(target, current) {
+      return Math.atan2(Math.sin(target - current), Math.cos(target - current));
+    }
+
+    function updateSpring(sword, dt) {
+      const targetX = (sword.x - 0.5) * worldW;
+      const targetY = -(sword.y - 0.5) * worldH;
+      const targetAngle = Math.atan2(sword.vy, sword.vx) - Math.PI / 2;
+      if (!sword.springReady) {
+        sword.springX = targetX;
+        sword.springY = targetY;
+        sword.springAngle = targetAngle;
+        sword.springReady = true;
+        return;
+      }
+      sword.springVX += (targetX - sword.springX) * SPRING_STIFFNESS * dt;
+      sword.springVY += (targetY - sword.springY) * SPRING_STIFFNESS * dt;
+      sword.springAngularVelocity += shortestAngleDelta(targetAngle, sword.springAngle) * SPRING_STIFFNESS * dt;
+      const damping = Math.exp(-SPRING_DAMPING * dt);
+      sword.springVX *= damping;
+      sword.springVY *= damping;
+      sword.springAngularVelocity *= damping;
+      sword.springX += sword.springVX * dt;
+      sword.springY += sword.springVY * dt;
+      sword.springAngle += sword.springAngularVelocity * dt;
+    }
+
+    function updateTrail(trail, sword, dt, shouldSample) {
+      for (let i = 0; i < TRAIL_POINT_COUNT; i++) {
+        trail.life[i] = Math.max(0, trail.life[i] - dt / TRAIL_LIFETIME);
+      }
+      if (shouldSample) {
+        sword.inner.updateWorldMatrix(true, false);
+        const tip = sword.inner.localToWorld(new THREE.Vector3(0, SWORD_TIP_LOCAL_Y, 0));
+        const offset = trail.nextIndex * 3;
+        trail.positions[offset] = tip.x;
+        trail.positions[offset + 1] = tip.y;
+        trail.positions[offset + 2] = tip.z;
+        trail.life[trail.nextIndex] = 1;
+        trail.nextIndex = (trail.nextIndex + 1) % TRAIL_POINT_COUNT;
+      }
+      trail.points.geometry.attributes.position.needsUpdate = true;
+      trail.points.geometry.attributes.aLife.needsUpdate = true;
+    }
+
+    function triggerBurst(sword, index, now) {
+      sword.lastBurstAt = now;
+      sword.burstScale = BURST_CLOUD_SCALE;
+      playBurstSound();
+      const shockwave = shockwaves[index];
+      shockwave.age = 0;
+      shockwave.duration = SHOCKWAVE_DURATION;
+      shockwave.startScale = 0.2;
+      shockwave.endScale = 4;
+      shockwave.maxOpacity = 0.9;
+      shockwave.mesh.visible = true;
+      shockwave.mesh.position.set((sword.x - 0.5) * worldW, -(sword.y - 0.5) * worldH, 0.1);
+      shockwave.mesh.scale.setScalar(0.2);
+      shockwave.material.opacity = 0.9;
+    }
+
+    function triggerSwordRitual(sword, index, now) {
+      sword.lastRitualAt = now;
+      sword.flash = 1;
+      const shockwave = shockwaves[index];
+      shockwave.age = 0;
+      shockwave.duration = RITUAL_RING_DURATION;
+      shockwave.startScale = RITUAL_RING_START_SCALE;
+      shockwave.endScale = RITUAL_RING_END_SCALE;
+      shockwave.maxOpacity = RITUAL_RING_OPACITY;
+      shockwave.mesh.visible = true;
+      shockwave.mesh.position.set((sword.x - 0.5) * worldW, -(sword.y - 0.5) * worldH, 0.1);
+      shockwave.mesh.scale.setScalar(RITUAL_RING_START_SCALE);
+      shockwave.material.opacity = RITUAL_RING_OPACITY;
+    }
+
+    function triggerSlash(sword, index, now, worldX, worldY) {
+      sword.lastSlashAt = now;
+      sword.recoil = 1;
+      const slash = slashPools[index][slashNext[index]];
+      slashNext[index] = (slashNext[index] + 1) % SLASH_POOL_SIZE;
+      slash.active = true;
+      slash.age = 0;
+      slash.direction.set(sword.moveDirX, sword.moveDirY);
+      slash.points.visible = true;
+      slash.points.position.set(worldX, worldY, 0.15);
+      slash.points.rotation.z = Math.atan2(sword.moveDirY, sword.moveDirX);
+      slash.points.scale.setScalar(1);
+      slash.material.uniforms.uOpacity.value = 1;
+      playSlashSound();
+    }
+
+    function updateSlash(slash, dt) {
+      if (!slash.active) return;
+      slash.age += dt;
+      const progress = Math.min(slash.age / SLASH_DURATION, 1);
+      slash.points.position.x += slash.direction.x * SLASH_TRAVEL_SPEED * dt;
+      slash.points.position.y += slash.direction.y * SLASH_TRAVEL_SPEED * dt;
+      slash.points.scale.setScalar(1 + 0.4 * progress);
+      slash.material.uniforms.uOpacity.value = (1 - progress) * (1 - progress);
+      if (progress >= 1) {
+        slash.active = false;
+        slash.points.visible = false;
+      }
+    }
+
+    function updateShockwave(shockwave, dt) {
+      if (!shockwave.mesh.visible) return;
+      shockwave.age += dt;
+      const progress = Math.min(shockwave.age / shockwave.duration, 1);
+      shockwave.mesh.scale.setScalar(shockwave.startScale + (shockwave.endScale - shockwave.startScale) * progress);
+      shockwave.material.opacity = shockwave.maxOpacity * (1 - progress);
+      if (progress >= 1) shockwave.mesh.visible = false;
+    }
+
+    function applyQualityStep(now) {
+      qualityStep++;
+      lastQualityStepAt = now;
+      lowFpsElapsed = 0;
+      if (qualityStep === 1) {
+        swords.forEach(sword => sword.geometry.setDrawRange(0, Math.floor(PARTICLES_PER_SWORD * QUALITY_PARTICLE_RATIO)));
+      } else if (qualityStep === 2) {
+        bloomPass.strength *= 0.5;
+        stars.points.visible = false;
+      } else if (qualityStep === 3) {
+        pixelRatio = 1;
+        renderer.setPixelRatio(pixelRatio);
+        composer.setPixelRatio(pixelRatio);
+        composer.setSize(window.innerWidth, window.innerHeight);
+        swords.forEach(sword => sword.material.uniforms.uPx.value = pixelRatio);
+        trails.forEach(trail => trail.material.uniforms.uPx.value = pixelRatio);
+        stars.material.uniforms.uPx.value = pixelRatio;
+        slashPools.forEach(pool => pool.forEach(slash => slash.material.uniforms.uPx.value = pixelRatio));
+      }
+    }
+
+    function updateFps(now, dt) {
+      const instantFps = 1 / Math.max(dt, 1e-3);
+      smoothFps += (instantFps - smoothFps) * (1 - Math.exp(-dt * FPS_SMOOTHNESS));
+      lowFpsElapsed = smoothFps < FPS_LOW_THRESHOLD ? lowFpsElapsed + dt : 0;
+      if (qualityStep < 3 && lowFpsElapsed >= FPS_LOW_DURATION && now - lastQualityStepAt >= QUALITY_STEP_INTERVAL * 1000) {
+        applyQualityStep(now);
+      }
+      if (now - fpsUpdateAt >= FPS_UPDATE_INTERVAL * 1000) {
+        fpsUpdateAt = now;
+        fpsStatus.textContent = `FPS: ${smoothFps.toFixed(0)}${qualityStep ? ` · 降级 ${qualityStep} 档` : ""}`;
+      }
+    }
+
+    function updateGame(now, dt) {
+      if (!GAME_ENABLED) return;
+      if (game.state !== "playing") return;
+      const elapsed = (now - game.startAt) / 1000, remaining = Math.max(0, GAME_TIME - elapsed);
+      if (remaining <= 0) { game.state = "over"; game.best = Math.max(game.best, game.score); try { localStorage.setItem("yujian-best", String(game.best)); } catch (_) {} gameMessage(); return; }
+      const interval = .9 - Math.min(elapsed / GAME_TIME, 1) * .45;
+      if (now >= game.spawnAt && gameOrbs.filter(o => o.active).length < GAME_MAX_ORBS) { spawnOrb(); game.spawnAt = now + interval * 1000; }
+      gameOrbs.forEach(o => { if (!o.active) return; o.age += dt; o.points.position.x += o.vx * dt; o.points.position.y += o.vy * dt + Math.sin(now / 700 + o.phase) * .03 * dt; o.points.rotation.z += dt; o.points.scale.setScalar(o.radius * (1 + Math.sin(now / 350 + o.phase) * .08)); if (o.age > GAME_ORB_LIFETIME || Math.abs(o.points.position.x) > worldW / 2 + 1.5 || Math.abs(o.points.position.y) > worldH / 2 + 1.5) { o.active = false; o.points.visible = false; } });
+      const tipHits = swords.map(sword => { if (sword.mode !== "sword" || sword.g <= .5 || sword.alpha <= .01) return null; sword.inner.updateWorldMatrix(true, false); return sword.inner.localToWorld(new THREE.Vector3(0, SWORD_TIP_LOCAL_Y, 0)); });
+      gameOrbs.forEach(o => { if (!o.active) return; let hitter = null; tipHits.forEach((tip, i) => { if (tip && !hitter && Math.hypot(tip.x - o.points.position.x, tip.y - o.points.position.y) < o.radius + .2) hitter = swords[i]; }); if (!hitter) slashPools.forEach(pool => pool.forEach(s => { if (s.active && !hitter && Math.hypot(s.points.position.x - o.points.position.x, s.points.position.y - o.points.position.y) < SLASH_RADIUS * .9 + o.radius) hitter = "slash"; })); if (hitter) hitOrb(o, hitter === "slash" ? null : hitter); });
+      gameShatters.forEach(s => { if (!s.active) return; s.age += dt; const a = s.age / .6; for (let i = 0; i < GAME_SHATTER_PARTICLES; i++) { s.positions[i * 3] = s.velocities[i * 3] * s.age * 1.5; s.positions[i * 3 + 1] = s.velocities[i * 3 + 1] * s.age * 1.5; s.positions[i * 3 + 2] = s.velocities[i * 3 + 2] * s.age * 1.5; } s.points.geometry.attributes.position.needsUpdate = true; s.mat.opacity = Math.max(0, 1 - a); if (a >= 1) { s.active = false; s.points.visible = false; } });
+      gameFloats.forEach(f => { if (!f.active) return; f.age += dt; f.el.style.left = `${f.x}px`; f.el.style.top = `${f.y - f.age / .8 * 60}px`; f.el.style.opacity = String(1 - f.age / .8); if (f.age >= .8) { f.active = false; f.el.style.display = "none"; } });
+      game.banner = Math.max(0, game.banner - dt); comboBanner.style.opacity = String(game.banner / .8); game.bloom *= Math.exp(-dt / .4); bloomPass.strength = (qualityStep >= 2 ? BLOOM_STRENGTH * .5 : BLOOM_STRENGTH) + game.bloom;
+      gameHud.innerHTML = `得分：${game.score}<br><span style="color:${remaining < 10 ? '#ff6570' : '#a8e8ff'};${remaining < 10 ? 'animation:pulse .7s infinite alternate' : ''}">剩余时间：${Math.ceil(remaining)}</span>${game.combo > 1 ? `<br>连击：×${game.combo}` : ""}`;
+    }
+
+    function startRenderLoop(landmarker) {
+      let lastVideoTime = -1;
+      let previousTime = performance.now();
+
+      function render(now) {
+        requestAnimationFrame(render);
+        const dt = Math.min((now - previousTime) / 1000, 0.1);
+        previousTime = now;
+        updateFps(now, dt);
+
+        if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+          lastVideoTime = video.currentTime;
+          updateTracking(landmarker.detectForVideo(video, now), now);
+        }
+
+        const interpolation = 1 - Math.exp(-dt * GESTURE_SMOOTHNESS);
+        const labels = [];
+        swords.forEach((sword, index) => {
+          const visible = now - sword.seenAt < HAND_LOST_MS;
+          sword.alpha += ((visible ? 1 : 0) - sword.alpha) * Math.min(1, dt * VISIBILITY_SMOOTHNESS);
+          sword.g += ((sword.mode === "sword" ? 1 : 0) - sword.g) * interpolation;
+          sword.cloudScale += ((sword.mode === "fist" ? 0.25 : 1) - sword.cloudScale) * interpolation;
+          sword.burstScale = 1 + (sword.burstScale - 1) * Math.exp(-dt / BURST_CLOUD_DECAY);
+          sword.recoil *= Math.exp(-dt / SLASH_RECOIL_DURATION);
+          sword.flash *= Math.exp(-dt / RITUAL_FLASH_DECAY);
+
+          updateSpring(sword, dt);
+          sword.group.visible = sword.alpha > 0.01;
+          sword.group.position.set(sword.springX, sword.springY, 0);
+          sword.group.rotation.z = sword.springAngle;
+          sword.group.scale.setScalar(THREE.MathUtils.clamp(sword.size / 0.16 * SWORD_SCALE, 0.7, 3.0) * (1 - 0.08 * sword.recoil));
+          sword.inner.rotation.y = Math.sin(now / 1000 * 1.2 + index) * 0.5;
+          sword.material.uniforms.uG.value = sword.g;
+          sword.material.uniforms.uT.value = now / 1000;
+          sword.material.uniforms.uCS.value = Math.max(sword.cloudScale, sword.burstScale);
+          sword.material.uniforms.uA.value = sword.alpha;
+          sword.material.uniforms.uPx.value = pixelRatio;
+          sword.material.uniforms.uFlash.value = sword.flash;
+          updateTrail(trails[index], sword, dt, visible && sword.mode === "sword" && sword.g > 0.5);
+          if (visible) labels.push(MODES[sword.mode]);
+        });
+        const visibleSwords = swords.filter(sword => now - sword.seenAt < HAND_LOST_MS);
+        const targetParallax = new THREE.Vector2();
+        if (visibleSwords.length) {
+          visibleSwords.forEach(sword => targetParallax.add(new THREE.Vector2(
+            (sword.x - 0.5) * worldW,
+            -(sword.y - 0.5) * worldH
+          )));
+          targetParallax.multiplyScalar(STAR_PARALLAX_STRENGTH / visibleSwords.length);
+        }
+        stars.parallax.lerp(targetParallax, 1 - Math.exp(-dt * STAR_PARALLAX_SMOOTHNESS));
+        stars.material.uniforms.uT.value = now / 1000;
+        stars.material.uniforms.uParallax.value.copy(stars.parallax);
+        shockwaves.forEach(shockwave => updateShockwave(shockwave, dt));
+        slashPools.forEach(pool => pool.forEach(slash => updateSlash(slash, dt)));
+        updateGame(now, dt);
+        const maxHandSpeed = visibleSwords.reduce((max, sword) => Math.max(max, sword.movementSpeed), 0);
+        updateWind(maxHandSpeed);
+        status.textContent = labels.join("　|　");
+        composer.render();
+      }
+      requestAnimationFrame(render);
+    }
+
+    try {
+      const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+      const landmarker = await HandLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2
+      });
+      video.srcObject = await navigator.mediaDevices.getUserMedia({
+        video: { width: PREVIEW_WIDTH, height: PREVIEW_HEIGHT, facingMode: "user" }
+      });
+      await video.play();
+      createCameraBackground();
+      updateCameraBackground();
+      hint.innerHTML = "剑指（食指+中指伸直）凝成飞剑；五指张开粒子四散；握拳粒子收拢聚气<br>手靠近摄像头剑变大；双手可各御一剑";
+      startRenderLoop(landmarker);
+    } catch (error) {
+      hint.textContent = `启动失败：${error.message}（请通过 localhost 或 https 打开，并允许摄像头权限）`;
+      console.error(error);
+    }
+  </script>
+</body>
+</html>
